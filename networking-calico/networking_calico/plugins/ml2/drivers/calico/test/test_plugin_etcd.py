@@ -23,6 +23,7 @@ import copy
 import json
 import logging
 import unittest
+import weakref
 
 from etcd3gw.utils import _decode
 
@@ -1247,6 +1248,198 @@ class TestPluginEtcd(TestPluginEtcdBase):
         """
         self.driver.delete_network_postcommit(None)
         self.driver.create_network_postcommit(None)
+
+    def sg_event_subscriptions(self):
+        """The security-group event subscriptions that the tests expect."""
+        return [
+            mock.call(
+                self.driver._sg_rule_created,
+                mech_calico.resources.SECURITY_GROUP_RULE,
+                mech_calico.events.AFTER_CREATE,
+            ),
+            mock.call(
+                self.driver._sg_rule_deleted,
+                mech_calico.resources.SECURITY_GROUP_RULE,
+                mech_calico.events.AFTER_DELETE,
+            ),
+            mock.call(
+                self.driver._sg_created,
+                mech_calico.resources.SECURITY_GROUP,
+                mech_calico.events.AFTER_CREATE,
+            ),
+            mock.call(
+                self.driver._sg_deleted,
+                mech_calico.resources.SECURITY_GROUP,
+                mech_calico.events.AFTER_DELETE,
+            ),
+        ]
+
+    def test_sg_registry_events(self):
+        """test_sg_registry_events
+
+        With plain ML2 as the core plugin, every security-group event is
+        the driver's to handle: check the plugin gate and each handler's
+        dispatch.
+        """
+
+        # Through a weakref proxy, as neutron_lib's plugin directory hands
+        # out in production, so this covers the proxy-safe plugin check.
+        # Keep a strong reference so that the proxy stays live.
+        class FakeMl2Plugin(object):
+            pass
+
+        ml2_plugin = FakeMl2Plugin()
+        get_plugin = mock.patch.object(
+            mech_calico.plugin_dir, "get_plugin", return_value=weakref.proxy(ml2_plugin)
+        )
+        get_plugin.start()
+        self.addCleanup(get_plugin.stop)
+        self.assertFalse(self.driver._sg_change_dispatched_by_plugin())
+
+        # One rule-create, end to end through the etcd write.
+        self.recent_writes = {}
+        payload = mock.MagicMock()
+        payload.context = self.make_context()
+        payload.states = [{"security_group_id": "SGID-default"}]
+        self.driver._sg_rule_created(None, None, None, payload=payload)
+        self.assertEtcdWrites({self.sg_default_key_v3: self.sg_default_value_v3})
+
+        # The other three handlers pass their event's SG ID and context
+        # through to security_groups_updated.
+        for handler in (
+            self.driver._sg_rule_deleted,
+            self.driver._sg_created,
+            self.driver._sg_deleted,
+        ):
+            payload = mock.MagicMock()
+            payload.context = self.make_context()
+            payload.metadata = {"security_group_id": "SGID-default"}
+            payload.resource_id = "SGID-default"
+            with mock.patch.object(self.driver, "security_groups_updated") as updated:
+                handler(None, None, None, payload=payload)
+                context = updated.call_args[0][0]
+                self.assertEqual(context.sgids, ["SGID-default"])
+                self.assertIs(context.plugin_context, payload.context)
+
+    def test_sg_registry_events_calico_plugin(self):
+        """test_sg_registry_events_calico_plugin
+
+        Under our own CalicoPlugin, the rule and security-group-delete
+        events are a second copy of a change the plugin has already
+        dispatched, so the handlers drop them; security-group creation is
+        still handled.  The plugin is recognised by its name, whatever
+        the case.
+        """
+
+        class FakeCALICOPlugin(object):
+            pass
+
+        # Through a weakref proxy, as neutron_lib's plugin directory hands
+        # out in production, so the name is read through the proxy.  Keep
+        # a strong reference so that the proxy stays live.
+        plugin = FakeCALICOPlugin()
+        with mock.patch.object(
+            mech_calico.plugin_dir, "get_plugin", return_value=weakref.proxy(plugin)
+        ):
+            self.assertTrue(self.driver._sg_change_dispatched_by_plugin())
+
+            with mock.patch.object(self.driver, "security_groups_updated") as updated:
+                for handler in (
+                    self.driver._sg_rule_created,
+                    self.driver._sg_rule_deleted,
+                    self.driver._sg_deleted,
+                ):
+                    handler(None, None, None, payload=mock.MagicMock())
+                updated.assert_not_called()
+
+                # Security-group creation reaches the driver only through
+                # this event, under either core plugin.
+                payload = mock.MagicMock()
+                payload.context = self.make_context()
+                payload.resource_id = "SGID-default"
+                self.driver._sg_created(None, None, None, payload=payload)
+                context = updated.call_args[0][0]
+                self.assertEqual(context.sgids, ["SGID-default"])
+                self.assertIs(context.plugin_context, payload.context)
+
+    def test_initialize_subscribes_callbacks(self):
+        """test_initialize_subscribes_callbacks
+
+        ``initialize`` must subscribe ``post_fork_initialize`` to the
+        PROCESS AFTER_INIT event, and the security-group events, before
+        the fork.
+        """
+        mech_calico.registry.subscribe.reset_mock()
+        # The test lib mocks out the driver's base class, so patch the
+        # (mock) base's initialize for the super() call to find.
+        with mock.patch.object(
+            mech_calico.mech_agent.SimpleAgentMechanismDriverBase,
+            "initialize",
+            create=True,
+        ):
+            with mock.patch.object(mech_calico, "_check_mysql_driver"):
+                with mock.patch.object(
+                    mech_calico.calico_config, "read_deprecated_options"
+                ):
+                    with mock.patch.object(
+                        mech_calico.cfg.CONF.calico, "fairy_gc_diagnostics", False
+                    ):
+                        self.driver.initialize()
+        self.assertEqual(
+            mech_calico.registry.subscribe.call_args_list,
+            [
+                mock.call(
+                    self.driver.post_fork_initialize,
+                    mech_calico.resources.PROCESS,
+                    mech_calico.events.AFTER_INIT,
+                    cancellable=True,
+                ),
+            ]
+            + self.sg_event_subscriptions(),
+        )
+
+    def test_post_fork_initialize_worker(self):
+        """test_post_fork_initialize_worker
+
+        In each forked worker process, AFTER_INIT must create the
+        connection state and re-subscribe the security-group events, and
+        must not start another worker's jobs.
+        """
+
+        class FakeWorker(object):
+            def start(self):
+                pass
+
+        for init in (
+            "_post_fork_init",
+            "_init_start_calico_resource_syncer",
+            "_init_start_calico_manager",
+            "_init_start_agent_status_watcher",
+            "_init_start_endpoint_status_watcher",
+        ):
+            patcher = mock.patch.object(self.driver, init)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        mech_calico.registry.subscribe.reset_mock()
+
+        # Reached through its bound start method, as Neutron's worker base
+        # publishes AFTER_INIT; a worker class the driver does not map to a
+        # specific job.
+        self.driver.post_fork_initialize(
+            mech_calico.resources.PROCESS,
+            mech_calico.events.AFTER_INIT,
+            FakeWorker().start,
+        )
+        self.driver._post_fork_init.assert_called_once_with()
+        self.driver._init_start_calico_resource_syncer.assert_not_called()
+        self.driver._init_start_calico_manager.assert_not_called()
+        self.driver._init_start_agent_status_watcher.assert_not_called()
+        self.driver._init_start_endpoint_status_watcher.assert_not_called()
+        self.assertEqual(
+            mech_calico.registry.subscribe.call_args_list,
+            self.sg_event_subscriptions(),
+        )
 
     def test_subnet_hooks(self):
         """Test subnet creation, update and deletion hooks."""

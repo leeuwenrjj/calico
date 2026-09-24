@@ -67,6 +67,7 @@ from networking_calico.common import config as calico_config
 from networking_calico.common import intern_string
 from networking_calico.logutils import logging_exceptions
 from networking_calico.monotonic import monotonic_time
+from networking_calico.plugins.calico.context import SGUpdateContext
 from networking_calico.plugins.ml2.drivers.calico import qos_driver
 from networking_calico.plugins.ml2.drivers.calico.election import Elector, elector_opt
 from networking_calico.plugins.ml2.drivers.calico.endpoints import (
@@ -448,9 +449,14 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
     def initialize(self):
         """Called once by ML2 in the parent process, before any forks.
 
-        We use this hook to subscribe to Neutron's process-AFTER_INIT callback so that
-        we get a chance to run code in each worker process we own (see ``get_workers``)
-        once it has been forked.
+        Subscribe to Neutron's process-AFTER_INIT callback so that we get a
+        chance to run code in each worker process we own (see
+        ``get_workers``) once it has been forked: see
+        ``post_fork_initialize``.  Also subscribe to the security-group
+        events that drive our dynamic NetworkPolicy updates
+        (``_subscribe_to_security_group_events``).  Subscribing before any
+        fork is what puts both into every process that can serve a REST
+        call.
 
         Also validate the configured MySQL driver up front so a bad
         ``[database] connection`` fails the worker at startup rather than
@@ -485,6 +491,71 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
             resources.PROCESS,
             events.AFTER_INIT,
             cancellable=True,
+        )
+        self._subscribe_to_security_group_events()
+
+    def _subscribe_to_security_group_events(self):
+        """Subscribe to the registry events for security-group changes.
+
+        Security-group changes must reach this driver so that we can update
+        the corresponding NetworkPolicy in etcd.  Under
+        ``core_plugin = calico``, ``CalicoPlugin``'s overrides of the
+        security-group CRUD methods provide that notification; under plain
+        ``core_plugin = ml2`` nothing does, and the NetworkPolicies in etcd
+        go stale until the next resync.  The AFTER_* events subscribed here
+        are published by ``SecurityGroupDbMixin``, which both core plugins
+        inherit, so they reach us under either one.
+
+        We subscribe from ``initialize``, before neutron-server forks any
+        worker: every process that can serve a security-group REST call
+        inherits the subscription.  ``post_fork_initialize`` re-subscribes
+        too -- idempotent, since the registry keys each callback by its
+        identity.
+
+        Under ``core_plugin = calico`` the rule and security-group-delete
+        events are a second copy of a change the plugin has already
+        dispatched, so the handlers drop them -- see
+        ``_sg_change_dispatched_by_plugin``.  That is decided when the event
+        arrives, not here, because the core plugin registers itself in the
+        plugin directory only after ``initialize`` has returned.
+        SECURITY_GROUP AFTER_CREATE is never dropped: no plugin override
+        dispatches security-group creation.
+
+        These AFTER_* events are normally published outside the DB
+        transaction that made the change, as our sync code requires.  The
+        one exception is a bulk rule create under plain ML2, whose events
+        fire inside the uncommitted outer transaction: a write that lands
+        before a later rule fails and rolls the batch back is drift, for
+        the next resync to repair.
+
+        SECURITY_GROUP AFTER_UPDATE (SG rename) is not subscribed: it does
+        not change the NetworkPolicy, and updating the
+        ``sg-name.projectcalico.org`` labels on WorkloadEndpoints needs the
+        endpoint syncer.  Left for separate work.
+        """
+        subscriptions = (
+            (
+                resources.SECURITY_GROUP_RULE,
+                events.AFTER_CREATE,
+                self._sg_rule_created,
+            ),
+            (
+                resources.SECURITY_GROUP_RULE,
+                events.AFTER_DELETE,
+                self._sg_rule_deleted,
+            ),
+            (resources.SECURITY_GROUP, events.AFTER_CREATE, self._sg_created),
+            (resources.SECURITY_GROUP, events.AFTER_DELETE, self._sg_deleted),
+        )
+        for resource, event, handler in subscriptions:
+            registry.subscribe(handler, resource, event)
+        # INFO per process, for diagnosis: the first thing to look for when
+        # a deployment reports that SG changes are not reaching etcd.
+        LOG.info(
+            "Subscribed to security-group registry events: %s",
+            ", ".join(
+                "%s/%s" % (resource, event) for resource, event, _ in subscriptions
+            ),
         )
 
     def get_workers(self):
@@ -572,6 +643,10 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
 
         self._post_fork_init()
 
+        # Idempotent re-subscription; see
+        # ``_subscribe_to_security_group_events``.
+        self._subscribe_to_security_group_events()
+
         worker_mapping = {
             CalicoManagerWorker: self._init_start_calico_manager,
             CalicoAgentStatusWatcherWorker: self._init_start_agent_status_watcher,
@@ -626,6 +701,18 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         self.subnet_syncer = SubnetSyncer(self.db)
         self.policy_syncer = PolicySyncer(self.db)
         self.endpoint_syncer = WorkloadEndpointSyncer(self.db, self.policy_syncer)
+
+    def _ensure_post_fork_init(self):
+        """Create this process's connection state if it doesn't have it yet.
+
+        A security-group event can be the first thing that reaches a
+        process that never saw the PROCESS callbacks that normally drive
+        ``post_fork_initialize``.  Build the state on demand rather than
+        failing the update.
+        """
+        if getattr(self, "policy_syncer", None) is None:
+            LOG.info("This process has no Calico sync state yet; creating it now.")
+            self._post_fork_init()
 
     def _init_start_calico_resource_syncer(self):
         self.start_up_resync_thread = eventlet.spawn(self._do_startup_resync)
@@ -1281,10 +1368,90 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         if host:
             self.endpoint_syncer.sync_wep(port, host, plugin_context)
 
+    # Handlers for the security-group registry events subscribed in
+    # ``_subscribe_to_security_group_events``.  Each extracts the affected
+    # security-group ID from the event payload and dispatches to
+    # ``security_groups_updated``, which does the CAS-protected NetworkPolicy
+    # write to etcd.  A handler that raises does not fail the operator's API
+    # request -- neutron-lib's registry aborts the request only for BEFORE_*
+    # and PRECOMMIT_* events -- so an etcd outage here leaves drift for the
+    # next resync to repair.
+
+    def _sg_change_dispatched_by_plugin(self):
+        """Has the core plugin already told us about this change itself?
+
+        ``CalicoPlugin``'s overrides of the security-group CRUD methods
+        dispatch rule and security-group-delete changes to us directly, so
+        when it is the core plugin the matching registry events are a
+        second copy of a change we have handled already, and the handlers
+        drop them.  Under plain ML2 nothing else dispatches, so every event
+        is ours to handle.
+
+        Looks for the name "calico" as the configured plugin.
+        """
+        plugin = plugin_dir.get_plugin()
+        names = (cfg.CONF.core_plugin or "", plugin.__class__.__name__)
+        if not any("calico" in name.lower() for name in names):
+            return False
+        return True
+
+    def _sg_rule_created(self, resource, event, trigger, payload=None):
+        """SECURITY_GROUP_RULE / AFTER_CREATE.
+
+        Neutron publishes this once per created rule -- on the bulk-create
+        path as well as the single-rule one -- with the created rule as
+        ``payload.states[0]``.
+        """
+        if self._sg_change_dispatched_by_plugin():
+            return
+        self.security_groups_updated(
+            SGUpdateContext(payload.context, [payload.states[0]["security_group_id"]])
+        )
+
+    def _sg_rule_deleted(self, resource, event, trigger, payload=None):
+        """SECURITY_GROUP_RULE / AFTER_DELETE.
+
+        The rule row has already been deleted by the time we are called, so
+        the SG ID comes from the payload metadata rather than from a DB read.
+        """
+        if self._sg_change_dispatched_by_plugin():
+            return
+        self.security_groups_updated(
+            SGUpdateContext(payload.context, [payload.metadata["security_group_id"]])
+        )
+
+    def _sg_created(self, resource, event, trigger, payload=None):
+        """SECURITY_GROUP / AFTER_CREATE.
+        No core plugin override dispatches security-group creation to us, so
+        unlike the other three handlers this one is not gated on
+        ``_sg_change_dispatched_by_plugin``.
+        """
+        self.security_groups_updated(
+            SGUpdateContext(payload.context, [payload.resource_id])
+        )
+
+    def _sg_deleted(self, resource, event, trigger, payload=None):
+        """SECURITY_GROUP / AFTER_DELETE.
+
+        Neutron deletes an SG's rules by DB cascade rather than by iterating
+        ``delete_security_group_rule``, so the rule-level event above does not
+        fire here.  ``sync_sgs_to_etcd`` re-reads the DB, finds no SG with
+        this ID, and CAS-deletes the corresponding NetworkPolicy from etcd.
+        """
+        if self._sg_change_dispatched_by_plugin():
+            return
+        self.security_groups_updated(
+            SGUpdateContext(payload.context, [payload.resource_id])
+        )
+
     def security_groups_updated(self, context):
         """Called whenever security group rules, membership or existence change."""
         TrackTask("SECURITY_GROUPS_UPDATED")
         LOG.info("SECURITY_GROUPS_UPDATED: %s", context)
+
+        # A registry event can be the first thing that reaches us in a
+        # process that never ran post_fork_initialize.
+        self._ensure_post_fork_init()
 
         # No outer writer/reader context here -- see create_port_postcommit for
         # rationale.  ``sync_sgs_to_etcd`` calls ``self.db.get_security_group_rules``,
